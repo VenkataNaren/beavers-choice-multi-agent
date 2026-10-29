@@ -1460,6 +1460,76 @@ def process_customer_request(raw_request: str) -> Dict[str, Any]:
 
     log.info("[Sales] report received | type=%s", type(sales_report).__name__)
 
+    # --- Compose customer-facing reply (transparent, no internal margins/errors) ---
+    customer_reply: Dict[str, Any] = {
+        "request_date": request_date,
+        "stage": "complete",
+        "items_requested": [{"item_name": line.item_name, "quantity": line.quantity} for line in raw_items],
+        "available_items": [{"item_name": l.item_name, "quantity": l.quantity} for l in available_items],
+        "unavailable_items": unavailable_items,
+        "quote": {
+            "lines": quote_data.get("lines", []),
+            "unknown_items": quote_data.get("unknown_items", []),
+            "total_units": quote_data.get("total_units", 0),
+            "subtotal": quote_data.get("subtotal", 0),
+            "discount_percent": quote_data.get("discount_percent", 0),
+            "discount_amount": quote_data.get("discount_amount", 0),
+            "total_price": quote_data.get("total_price", 0),
+            "quote_explanation": quote_data.get("quote_explanation", ""),
+        },
+        "sales": sales_report if isinstance(sales_report, dict) else {"raw_output": str(sales_report)},
+        "notes": "",
+    }
+
+    # --- Politely note unavailable items in the customer reply ---
+    if unavailable_items:
+        unavailable_summary = "; ".join(
+            f"{u['item_name']} (qty {u['quantity']}): {u['reason']}" for u in unavailable_items
+        )
+        customer_reply["notes"] += (
+            f"The following items could not be fulfilled: {unavailable_summary}. "
+        )
+
+    # --- Politely note blocked lines in the customer reply ---
+    if blocked_lines:
+        blocked_summary = "; ".join(
+            f"{b['item_name']} (qty {b['quantity']}): {b['reason']}" for b in blocked_lines
+        )
+        customer_reply["notes"] += (
+            f"The following items could not be sold due to stock constraints: {blocked_summary}. "
+        )
+
+    # --- Graceful error fallback: never leak raw system errors to the customer ---
+    error_stages: List[str] = []
+    if triage_result is None:
+        error_stages.append("triage")
+    if isinstance(inventory_report, dict) and "_error" in inventory_report:
+        error_stages.append("inventory")
+    if isinstance(quote_data, dict) and "_error" in quote_data:
+        error_stages.append("quoting")
+    if isinstance(sales_report, dict) and "_error" in sales_report:
+        error_stages.append("sales")
+
+    if error_stages:
+        customer_reply["notes"] += (
+            "We could not complete this request, please contact customer support. "
+        )
+        customer_reply["error_stages"] = error_stages
+
+    # --- Internal telemetry (never shown to the customer) ---
+    internal_audit: Dict[str, Any] = {
+        "stock_checks": stock_checks,
+        "inventory_report_raw": inventory_report,
+        "catalog_audit": {
+            "available_items": [{"item_name": l.item_name, "quantity": l.quantity} for l in available_items],
+            "unavailable_items": unavailable_items,
+            "match_details": match_audit,
+        },
+        "blocked_sales_lines": blocked_lines,
+        "quote_data_raw": quote_data,
+        "sales_report_raw": sales_report,
+    }
+
     # --- Compose final structured response ---
     return {
         "triage": (
@@ -1467,16 +1537,8 @@ def process_customer_request(raw_request: str) -> Dict[str, Any]:
             if hasattr(triage_result, "model_dump")
             else dict(triage_result)
         ),
-        "inventory_report": inventory_report,
-        "quote": quote_data,
-        "sales_report": sales_report,
-        "catalog_audit": {
-            "available_items": [{"item_name": l.item_name, "quantity": l.quantity} for l in available_items],
-            "unavailable_items": unavailable_items,
-            "match_details": match_audit,
-        },
-        "stock_checks": stock_checks,
-        "blocked_sales_lines": blocked_lines,
+        "customer_reply": customer_reply,
+        "internal_audit": internal_audit,
         "request_date": request_date,
         "stage": "complete",
     }
