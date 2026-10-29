@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+.vscode/
+*.db
+test_connection.py
+check_model.py
