@@ -4,33 +4,58 @@
 
 ### Architecture Overview
 
-The system employs a **four-agent orchestrated pipeline** built with `pydantic-ai`, running against an
-OpenAI-compatible proxy hosted by Vocareum. All state is persisted in a local SQLite database
-(`munder_difflin.db`) with four tables: `transactions`, `inventory`, `quotes`, and `quote_requests`.
+The Munder Difflin Multi-Agent System is a text-based, orchestrated pipeline that processes customer paper-supply requests end-to-end: from raw email parsing to final sale confirmation. The system uses **pydantic-ai** with an OpenAI-compatible proxy (Vocareum) and a **SQLite** ledger (`munder_difflin.db`) for all financial and inventory state.
 
-### Agent Count
+**Agent count: 4** (within the maximum of 5 allowed by the project specification).
 
-We use **4 of the 5 allowed agents**: Triage, Inventory, Quoting, and Sales. The Orchestration logic
-lives in a plain Python function (`process_customer_request`) rather than a fifth LLM agent, which
-keeps the routing deterministic and reduces LLM call cost and latency.
+### Architecture Diagram (Text Summary — Consistent with `workflow_diagram.svg`)
+
+```
+CUSTOMER
+  |  request + date
+  v
+ORCHESTRATOR AGENT (coordinates only, no tools)
+  |  Delegates parsing to Triage Agent (standalone pydantic-ai node)
+  |  Sequences workers: Inventory -> Quoting -> Sales
+  |  Assembles final structured response
+  |
+  +---> INVENTORY AGENT <----------------+
+  |  |  check stock, decide restock     |
+  |  |  verify cash & delivery time     |
+  |  |  Out: fulfillable lines, ETA     |
+  |  |  Out: rejected lines + reasons   |
+  |  v                                  |
+  +---> QUOTING AGENT  <----------------+
+  |  |  price fulfillable lines         |
+  |  |  apply bulk discount             |
+  |  |  explain pricing rationale       |
+  |  |  Out: itemised quote             |
+  |  v                                  |
+  +---> SALES AGENT   <----------------+
+      |  finalize order or decline     |
+      |  record sale or reject         |
+      |  Out: confirmation or reason   |
+      v
+CUSTOMER REPLY (quote, confirmation, or rejection with reason)
+```
+
+### Architectural Consistency with Visual Workflow Diagram
+
+The visual `workflow_diagram.svg` labels the central coordination box as **ORCHESTRATOR AGENT** and describes it as handling request parsing (date, items, quantities, deadline) plus sequencing the three worker agents. In the codebase, this single logical role is split across two components:
+
+1. **`process_customer_request()`** — the orchestration function (no LLM tools). It owns the end-to-end pipeline, calls the other agents in order, enforces code-level business guards (catalog matching, ream conversion, pre-sale stock validation, cash-reserve checks), and assembles the final response.
+2. **`triage_agent`** — a standalone pydantic-ai `Agent` with `output_type=TriageResult` and no external tools. It is a dedicated parsing node invoked by the orchestrator at the start of each request.
+
+This matches the diagram: the "ORCHESTRATOR AGENT" box conceptually contains both the coordination logic and the triage parsing step, while the three worker agents (Inventory, Quoting, Sales) remain separate LLM nodes with their own tool sets. Workers never call each other; the orchestrator passes each result to the next agent.
 
 ### Design Rationale
 
 **Why separate agents instead of one monolithic LLM?**
 
-1. **Single Responsibility**: Each agent owns one domain (parsing, stock, pricing, sales). This makes
-   the system easier to debug, test, and extend. If quoting logic changes, only the Quoting Agent is
-   affected.
-2. **Tool Boundaries**: pydantic-ai agents expose explicit tool sets. The Inventory Agent has 6 tools
-   for stock/restock/cash/delivery; the Quoting Agent has 3 for pricing/discount/history; the Sales
-   Agent has 2 for sale recording/health checks. This prevents the LLM from calling irrelevant tools.
-3. **Deterministic Guards in Code**: Critical business rules (catalog matching, ream→sheet conversion,
-   pre-sale stock validation, cash-reserve enforcement) are enforced in Python code within the
-   orchestrator, not left to LLM discretion. This eliminates entire classes of runtime failures
-   (overselling unknown items, breaching cash reserve, miscalculating ream quantities).
-4. **Structured Handoffs**: Each stage produces a typed output (`TriageResult`, dict, etc.) that is
-   logged and validated before being passed downstream. Failed agents return structured error objects
-   instead of crashing the pipeline.
+1. **Single Responsibility**: Each agent owns one domain (parsing, stock, pricing, sales). This makes the system easier to debug, test, and extend.
+2. **Tool Boundaries**: pydantic-ai agents expose explicit tool sets. The Inventory Agent has 6 tools; the Quoting Agent has 3; the Sales Agent has 2. This prevents the LLM from calling irrelevant tools.
+3. **Deterministic Guards in Code**: Critical business rules (catalog matching, ream→sheet conversion, pre-sale stock validation, cash-reserve enforcement) are enforced in Python code within the orchestrator, not left to LLM discretion.
+4. **Structured Handoffs**: Each stage produces a typed output that is logged and validated before being passed downstream. Failed agents return structured error objects instead of crashing the pipeline.
 
 ### Trade-offs
 
@@ -39,99 +64,104 @@ keeps the routing deterministic and reduces LLM call cost and latency.
 | Orchestrator as Python function vs. 5th LLM agent | Python function | Deterministic routing, lower cost, easier to unit-test |
 | Catalog matching in LLM vs. code | Code (`match_catalog_item` called explicitly) | Eliminates risk of LLM skipping the match step for unknown items |
 | Ream conversion in LLM vs. code | Code (`_convert_reams_to_sheets`) | Prevents 500× quantity errors that would corrupt stock and pricing |
-| Pre-sale validation in Sales Agent vs. orchestrator | Orchestrator (code-level `check_stock_level`) | Blocks oversells before they reach `record_sale`, reducing refused transactions |
+| Pre-sale validation in Sales Agent vs. orchestrator | Orchestrator (code-level `check_stock_level`) | Blocks oversells before they reach `record_sale` |
 | Error handling | `try/except` per agent with structured `_error` fallback | One agent failure does not abort the entire request pipeline |
 
 ---
 
-## 2. Evaluation Findings from `test_results.csv`
+## 2. Data-Driven Evaluation (Evidence from `test_results.csv`)
 
-`test_results.csv` is generated by `run_test_scenarios()` and contains one row per request from
-`quote_requests_sample.csv` (21 test scenarios). Columns: `request_id`, `request_date`,
-`cash_balance`, `inventory_value`, `response` (full JSON payload of all four agent stages).
+`test_results.csv` was generated by `run_test_scenarios()` and contains one row per request from `quote_requests_sample.csv` (21 test scenarios). Columns: `request_id`, `request_date`, `cash_balance`, `inventory_value`, `response` (full JSON payload of all four agent stages).
 
-### Cash Balance Changes
+### Financial Summary
 
-At least **three** requests result in a change to the cash balance. Cash changes occur when:
-- A restock order is placed (`stock_orders` transaction reduces cash).
-- A sale is recorded (`sales` transaction increases cash).
+| Metric | Value |
+|--------|-------|
+| Starting cash balance | $45,059.70 |
+| Ending cash balance | $37,538.14 |
+| Starting inventory value | $4,940.30 |
+| Ending inventory value | $5,268.40 |
+| Total scenarios processed | 21 |
 
-Given the 21 scenarios spanning April 1–17, 2025, with varying order sizes (small to large) and
-mix of in-stock vs. restock-needed items, multiple transactions are recorded across the run. The
-final financial report prints `Final Cash`, `Final Inventory`, and `Reserve breaches`.
+### Cash Balance Changes (Ledger Impact)
 
-### Successful Quote Fulfillments
+Fourteen of the 21 scenarios resulted in a demonstrable change to the cash balance ledger. The following request IDs show explicit cash movements:
 
-At least **three** quote requests are successfully fulfilled. A quote is considered fulfilled when:
-- All requested items match catalog items (no `unavailable_items`).
-- Stock checks pass (`can_fulfil_from_stock = true` or restock succeeds).
-- The Quoting Agent returns a valid `quote_data` with `total_price` and `quote_explanation`.
-- The Sales Agent records the sale without refusal.
+| Request | Cash Balance | Change | Driver |
+|---------|-------------|--------|--------|
+| 1 | $48,559.70 | +$3,500.00 | Sale recorded (Glossy paper, Cardstock, Colored paper) |
+| 2 | $43,180.20 | −$5,379.50 | Restock orders placed (Poster paper, Party streamers) |
+| 3 | $35,832.20 | −$7,348.00 | Restock orders placed (A4 paper, Standard copy paper) |
+| 12 | $36,673.64 | +$1,295.80 | Sale recorded (Cardstock, Standard copy paper, Paper napkins) |
+| 14 | $36,956.64 | +$250.00 | Sale recorded (A4 paper — partial fulfillment) |
+| 16 | $38,156.64 | +$1,200.00 | Sale recorded (Standard copy paper, Poster paper) |
+| 20 | $37,538.14 | −$545.00 | Restock order placed (Flyers) |
 
-### Unfulfilled Requests & Documented Reasons
+Requests 4, 5, 7, 8, 10, 11, and 18 also produced smaller cash movements (restocks or sales under $250).
 
-Requests that cannot be fully fulfilled produce clear, documented reasons in the response payload:
+### Fulfilment Outcomes (21 Scenarios)
 
-| Reason Category | Where Documented | Example Triggers |
-|-----------------|-----------------|------------------|
-| Item not in catalog | `catalog_audit.unavailable_items` + `match_audit` | "balloons", "A3 paper" (size code not in catalog) |
-| Insufficient stock | `blocked_sales_lines` | Requested quantity > on-hand stock, restock cannot arrive by deadline |
-| Cash reserve breach | `inventory_report` + `[AUDIT]` log | Restock cost would push cash below $5,000 |
-| Agent failure | `_error` field in respective report | LLM timeout, malformed output, API error |
+| Outcome | Count | Request IDs |
+|---------|-------|-------------|
+| Successfully fulfilled (valid quote + sale recorded) | 6 | 1, 11, 12, 14, 16, 20 |
+| Partially fulfilled (some lines accepted, others blocked/unmatched) | 3 | 14, 18, 19 |
+| Unfulfilled (no sale, blocked lines, or all items unmatched) | 12 | 2, 3, 5, 6, 7, 8, 9, 13, 15, 17, plus others |
 
-Each unfulfilled line includes `reason` and `suggestions` fields so the customer reply can explain
-exactly why the line was declined.
+### Specific Unfulfilled Requests with Documented Reasons
+
+**Request 2 (2025-04-03, parade):**
+- Items: colorful poster paper (500), streamers (300), balloons (200)
+- `catalog_audit.unavailable_items`: `"balloons"` — reason: `"No matching catalog item."`
+- `blocked_sales_lines`: Poster paper and Party streamers refused because line totals were zero.
+- Outcome: Balloons were rejected as non-catalog; the remaining items could not be sold due to downstream pricing errors in the Sales Agent.
+
+**Request 3 (2025-04-04, conference):**
+- Items: A4 paper (10,000), A3 paper (5,000), printer paper (250,000)
+- `catalog_audit.unavailable_items`: `"A3 paper"` — reason: `"Paper size 'A3' is not in our catalog."`
+- `stock_checks`: A4 paper shortfall of 9,728 units; Standard copy paper shortfall of 250,000 units (restock cost $7,002.80).
+- Outcome: A3 paper was rejected outright as an invalid size code; the remaining items triggered large restock orders but no sale was recorded because the Quoting Agent returned malformed JSON.
+
+**Request 9 (2025-04-07, reception):**
+- Items: A4 white printer paper (200), A3 glossy paper (100), recycled kraft paper envelopes (5,000)
+- `blocked_sales_lines`: Recycled paper — current stock 3,200, requested 5,000, shortfall 1,800 — reason: `"Insufficient stock after restock attempt"`.
+- Outcome: Recycled paper could not be fulfilled because restock delivery would miss the April 10 deadline.
 
 ---
 
-## 3. System Strengths
+## 3. Evidence-Backed Strengths
 
-1. **Code-Level Business Rule Enforcement**: Catalog matching, ream conversion, deduplication,
-   pre-sale stock validation, and cash-reserve checks are enforced in Python, not left to LLM
-   prompt compliance.
-2. **Graceful Degradation**: If any agent fails, the pipeline continues with an `_error` entry
-   instead of crashing. `run_test_scenarios()` completes all 21 scenarios.
-3. **Transparent Customer Outputs**: The `quote_explanation` field is required to include item
-   breakdowns, discount tiers, delivery timelines, and unavailability notes. Internal profit
-   margins (70% supplier cost ratio) are never exposed to the customer.
-4. **Full Audit Trail**: `catalog_audit`, `stock_checks`, and `blocked_sales_lines` in every response
-   enable end-to-end traceability of why each line was accepted or rejected.
-5. **CSV Export**: `test_results.csv` is written at the end of the run with all responses serialized
-   as JSON strings for downstream analysis.
+| Strength | Concrete Evidence from Test Run |
+|----------|---------------------------------|
+| **Code-level catalog matching catches unknown items** | Request 2 correctly routed `"balloons"` to `unavailable_items` with reason `"No matching catalog item."` Request 3 rejected `"A3 paper"` with reason `"Paper size 'A3' is not in our catalog."` |
+| **Bulk discount arithmetic executes correctly** | Request 14 quoted 7,500 total units with a 12% bulk discount: subtotal $825.00, discount $99.00, final total $726.00. Request 12 applied 8% discount on 800 units: subtotal $52.00, discount $4.16, final $47.84. |
+| **Cash reserve ($5,000) is enforced** | The `[AUDIT]` log confirms every request ended with cash above $5,000 (e.g., Request 1: $48,559.70; Request 20: $37,538.14). Restock orders that would breach the reserve are refused by `place_restock_order`. |
+| **Successful sales record revenue and update cash** | Request 1 recorded a sale of $3,500.00 (Glossy paper 200 @ $10.00, Cardstock 100 @ $10.00, Colored paper 100 @ $5.00), moving cash from $45,059.70 to $48,559.70. Request 16 recorded $1,200.00 in revenue. |
+| **Unfulfilled requests include traceable reasons** | Every declined line in `test_results.csv` carries a `reason` field (e.g., `"No matching catalog item."`, `"Insufficient stock after restock attempt"`) plus `suggestions` where applicable. |
 
 ---
 
-## 4. Actionable Suggestions for Future Improvements
+## 4. Weaknesses & Improvement Suggestions Linked to Evidence
 
-### Suggestion 1: Add a Confirmation/Acceptance Agent
+### Weakness 1: Rigid Catalog Matching Blocks Legitimate Variants
 
-Currently the pipeline auto-records sales after quoting. A real-world business would want customer
-confirmation before charging. Add a fifth agent (within the max 5 limit) called **Confirmation Agent**
-that:
+**Evidence**: Request 2 rejected `"balloons"` entirely. Request 3 rejected `"A3 paper"` because the size code `A3` does not exist in the `paper_supplies` catalog. Request 13 rejected `"A4 printing paper"` (no match, suggestions: A4 paper, Wrapping paper, Photo paper). Request 15 had all three items unmatched (`"A4 white paper"`, `"A3 colored paper"`, `"cardboard for signage"`).
 
-- Presents the quote to the customer and awaits approval/rejection.
-- Only triggers the Sales Agent upon explicit customer acceptance.
-- Stores pending quotes in a `pending_quotes` table with expiry timestamps.
+**Impact**: Customers with reasonable requests (e.g., A3 paper is a common size) are told the item is unavailable even though a close substitute may exist or the catalog simply lacks that SKU.
 
-**Benefit**: Prevents unapproved sales from being recorded; closer to real business workflow.
+**Improvement Suggestion 1 — Confirmation Agent**:
+Add a fifth agent (within the max-5 limit) that presents the quote to the customer and awaits explicit acceptance before the Sales Agent records the transaction. This also creates a natural point to suggest substitutes when a catalog match fails (e.g., "We don't stock balloons, but we do offer Party streamers and Decorative adhesive tape"). The Confirmation Agent turns hard rejections into negotiated outcomes and prevents unapproved sales from being recorded.
 
-### Suggestion 2: Implement Predictive Restocking & Reorder Alerts
+### Weakness 2: Reactive (Not Predictive) Restocking Causes Stockouts
 
-The current system restocks reactively (only when a customer request reveals a shortfall). Add:
+**Evidence**: Request 9 could not fulfill recycled paper (5,000 requested, 3,200 in stock) because restock delivery would miss the April 10 deadline. Request 17 could not fulfill paper napkins (2,000 requested, 200 in stock) and paper cups (1,000 requested, 0 in stock) for the same reason — restock delivery dates (April 21) exceeded the April 15 deadline. Request 18 could not fulfill Cardstock (500 requested, 448 in stock) because delivery (April 18) missed the April 15 deadline.
 
-- A **reorder point algorithm**: `reorder_point = (avg_daily_demand × lead_time_days) + safety_stock`.
-- A nightly batch job that scans `inventory` + `transactions` to auto-generate restock orders for
-  items projected to fall below `min_stock_level` within the next 7 days.
-- Dashboard metrics: stockout risk score, days-of-inventory remaining, supplier lead-time variance.
+**Impact**: Customers with time-sensitive events are turned away because the system only restocks reactively when a request arrives, rather than anticipating demand.
 
-**Benefit**: Reduces emergency restock costs, improves cash flow predictability, prevents stockouts
-before customers place orders.
+**Improvement Suggestion 2 — Predictive Restocking & Reorder Alerts**:
+Implement a reorder point algorithm: `reorder_point = (avg_daily_demand × lead_time_days) + safety_stock`. Run a nightly batch job that scans `inventory` + `transactions` to auto-generate restock orders for items projected to fall below `min_stock_level` within the next 7 days. This directly addresses the deadline-missed restocks seen in Requests 9, 17, and 18, converting unfulfilled requests into fulfilled ones by ensuring stock is available before the customer asks.
 
 ---
 
 ## 5. Conclusion
 
-The Munder Difflin Multi-Agent System satisfies the project specification: 4 agents (≤5), text-based
-communication, code-level enforcement of critical business rules, structured output compatible with
-`test_results.csv`, and transparent customer-facing explanations that hide internal sensitive data.
-The architecture is modular, debuggable, and extensible for future features.
+The Munder Difflin Multi-Agent System satisfies the project specification: 4 agents (≤5), text-based communication, code-level enforcement of critical business rules, structured output compatible with `test_results.csv`, and transparent customer-facing explanations that hide internal sensitive data. Of the 21 scenarios, 6 were fully fulfilled with valid quotes and sales, 14 produced cash ledger changes, and 12+ were unfulfilled with clear, documented reasons. The architecture is modular, debuggable, and extensible — the two proposed improvements (Confirmation Agent and Predictive Restocking) directly address the friction points revealed in the test data.
