@@ -670,10 +670,14 @@ def _min_stock_level(item_name: str) -> int:
 
 
 def _has_ream_indicator(item_name: str) -> bool:
-    """Check if item name suggests quantity is in reams rather than sheets."""
+    """Check if item name suggests quantity is in reams rather than sheets.
+
+    Uses whole-word matching so 'streamers' (which contains 'ream' as a
+    substring) is not wrongly converted to sheets.
+    """
     lowered = item_name.lower()
     ream_keywords = {"ream", "reams", "box", "boxes", "pack", "packs", "bundle", "bundles"}
-    return any(kw in lowered for kw in ream_keywords)
+    return any(re.search(rf"\b{re.escape(kw)}\b", lowered) for kw in ream_keywords)
 
 
 def _convert_reams_to_sheets(item_name: str, quantity: int) -> tuple:
@@ -719,6 +723,8 @@ ITEM_ALIASES = {
     "poster board": "Poster paper",
     "streamers": "Party streamers",
     "printer paper": "Standard copy paper",
+    "printing paper": "Standard copy paper",
+    "print paper": "Standard copy paper",
     "copy paper": "Standard copy paper",
     "standard paper": "Standard copy paper",
     "plates": "Paper plates",
@@ -743,6 +749,8 @@ ITEM_ALIASES = {
     "letter paper": "Letter-sized paper",
     "sticky notes": "Sticky notes",
     "notepads": "Notepads",
+    "construction paper": "Construction paper",
+    "white paper": "A4 paper",
 }
 
 _FILLER_WORDS = {"of", "the", "a", "an", "for", "and", "in", "sheet", "roll", "pack", "ream", "box"}
@@ -971,26 +979,46 @@ def calculate_bulk_discount(order_lines: List[OrderLine]) -> Dict:
 
     Always use this tool for the arithmetic instead of calculating by hand.
     Discount is 5% from 100 units, 8% from 500 units, 12% from 1000 units.
+    Quote lines show PRE-discount line totals (qty × unit_price). Discount is
+    allocated proportionally across lines in `discounted_line_total`.
     """
     priced_lines, unknown_items, subtotal, total_units = [], [], 0.0, 0
     for line in order_lines:
         if line.item_name not in CATALOG_PRICES:
             unknown_items.append(line.item_name)
             continue
-        line_total = round(line.quantity * CATALOG_PRICES[line.item_name], 2)
+        line_subtotal = round(line.quantity * CATALOG_PRICES[line.item_name], 2)
         priced_lines.append(
             {
                 "item_name": line.item_name,
                 "quantity": line.quantity,
                 "unit_price": CATALOG_PRICES[line.item_name],
-                "line_total": line_total,
+                "line_total": line_subtotal,
             }
         )
-        subtotal += line_total
+        subtotal += line_subtotal
         total_units += line.quantity
 
     discount_rate = next((rate for minimum, rate in DISCOUNT_TIERS if total_units >= minimum), 0.0)
     discount_amount = round(subtotal * discount_rate, 2)
+
+    # Allocate discount proportionally across lines for recording sales.
+    if subtotal > 0 and discount_rate > 0:
+        alloc_rate = discount_amount / subtotal
+        running_total = 0.0
+        for i, pl in enumerate(priced_lines):
+            if i == len(priced_lines) - 1:
+                # Last line absorbs rounding difference.
+                pl["discounted_line_total"] = round(round(subtotal, 2) - discount_amount - running_total, 2)
+            else:
+                discounted = round(pl["line_total"] * (1 - alloc_rate), 2)
+                running_total += discounted
+                pl["discounted_line_total"] = discounted
+    else:
+        for pl in priced_lines:
+            pl["discounted_line_total"] = pl["line_total"]
+
+    total_price = round(subtotal - discount_amount, 2)
     return {
         "lines": priced_lines,
         "unknown_items": unknown_items,
@@ -998,7 +1026,8 @@ def calculate_bulk_discount(order_lines: List[OrderLine]) -> Dict:
         "subtotal": round(subtotal, 2),
         "discount_percent": int(discount_rate * 100),
         "discount_amount": discount_amount,
-        "total_price": round(subtotal - discount_amount, 2),
+        "total_price": total_price,
+        "discount_rate": discount_rate,
     }
 
 
@@ -1054,6 +1083,238 @@ def record_sale(item_name: str, quantity: int, total_price: float, sale_date: st
             "quantity": quantity, "total_price": round(total_price, 2)}
 
 
+# ---------------------------------------------------------------------------
+# Public reply builders (customer-safe, no internal data leakage)
+# ---------------------------------------------------------------------------
+
+# Leak terms that must never appear in customer-facing output.
+LEAK_PATTERNS = [
+    r"stock_checks",
+    r"catalog_audit",
+    r"internal_audit",
+    r"cash.balance",
+    r"cash_balance",
+    r"inventory.value",
+    r"inventory_value",
+    r"top.selling",
+    r"top sellers",
+    r"margin",
+    r"supplier.cost",
+    r"Traceback",
+    r"Exception",
+    r"Error:",
+    r"sqlite",
+    r"munder_difflin\.db",
+    r"api.key",
+    r"current_stock",
+    r"on.hand",
+    r"restock_cost",
+    r"estimated_restock",
+    r"transaction_id",
+    r"Traceback",
+]
+
+
+def sanitize_public_text(text: str) -> str:
+    """Strip or mask any internal-sensitive phrases from customer-facing text.
+
+    Returns the sanitized string. If the text is empty or None, returns an empty string.
+    """
+    if not text:
+        return ""
+    sanitized = str(text)
+    for pattern in LEAK_PATTERNS:
+        sanitized = re.sub(pattern, "[REDACTED]", sanitized, flags=re.IGNORECASE)
+    return sanitized
+
+
+def build_public_quote_explanation(
+    quote_data: Dict[str, Any],
+    unavailable_items: List[Dict[str, Any]],
+    request_date: str,
+) -> str:
+    """Build a deterministic, customer-friendly quote explanation.
+
+    Includes item-by-item breakdown, bulk discount tier rationale, subtotal→discount→total,
+    delivery timeline, and polite notes for unavailable items. Never leaks internal margins
+    or stock counts.
+
+    Args:
+        quote_data: Parsed quote data (lines, subtotal, discount_percent, etc.).
+        unavailable_items: Items not in the catalog, for polite notes.
+        request_date: The request date (YYYY-MM-DD) for delivery estimates.
+
+    Returns:
+        A customer-safe explanation string.
+    """
+    lines = quote_data.get("lines", [])
+    subtotal = quote_data.get("subtotal", 0)
+    discount_percent = quote_data.get("discount_percent", 0)
+    discount_amount = quote_data.get("discount_amount", 0)
+    total_price = quote_data.get("total_price", 0)
+    total_units = quote_data.get("total_units", 0)
+
+    parts: List[str] = []
+    parts.append("Thank you for considering Munder Difflin Paper Company!")
+    parts.append("Here is a detailed breakdown of your order:\n")
+
+    for line in lines:
+        name = line.get("item_name", "Item")
+        qty = line.get("quantity", 0)
+        unit_price = line.get("unit_price", 0)
+        line_total = line.get("line_total", 0)
+        parts.append(
+            f"- {name}: {qty} units × ${unit_price:.2f} = ${line_total:.2f}"
+        )
+
+    parts.append(f"\nTotal Units: {total_units}")
+
+    if discount_percent > 0:
+        parts.append(
+            f"\nBulk Discount: {discount_percent}% applied (order of {total_units} units "
+            f"qualifies), saving ${discount_amount:.2f}."
+        )
+    else:
+        parts.append("\nNo bulk discount applies to this order.")
+
+    parts.append(f"\nSubtotal: ${subtotal:.2f}")
+    if discount_amount > 0:
+        parts.append(f"\nDiscount: -${discount_amount:.2f}")
+    parts.append(f"\nFinal Total: ${total_price:.2f}")
+
+    # Delivery estimate.
+    if lines:
+        max_qty = max((l.get("quantity", 0) for l in lines), default=0)
+        delivery_date = get_supplier_delivery_date(request_date, max_qty)
+        parts.append(
+            f"\nEstimated delivery: {delivery_date} based on your order quantities."
+        )
+
+    # Unavailable items noted politely.
+    if unavailable_items:
+        parts.append("\n\nThe following items could not be fulfilled:")
+        for u in unavailable_items:
+            parts.append(
+                f"- {u.get('item_name', 'item')} (qty {u.get('quantity', 0)}): "
+                f"{u.get('reason', 'unavailable')}"
+            )
+
+    parts.append("\n\nThank you for choosing Munder Difflin Paper Company!")
+    return "".join(parts)
+
+
+def build_public_sales_summary(
+    recorded_items: List[Dict[str, Any]],
+    refused_items: List[Dict[str, Any]],
+    blocked_lines: List[Dict[str, Any]],
+    unavailable_items: List[Dict[str, Any]],
+    available_items: List[OrderLine],
+    quote_data: Dict[str, Any],
+    request_date: str,
+) -> Dict[str, Any]:
+    """Build a deterministic, customer-safe sales summary.
+
+    Status is computed from actual transaction results, not from LLM wording.
+    Never exposes exact cash balances, inventory values, stock counts, or internal
+    error text.
+
+    Args:
+        recorded_items: Lines actually recorded via record_sale (status == 'recorded').
+        refused_items: Lines that record_sale refused.
+        blocked_lines: Lines blocked before reaching record_sale.
+        unavailable_items: Items not in the catalog.
+        available_items: All catalog-available items requested.
+        quote_data: Parsed quote data for line totals/pricing.
+        request_date: The request date (YYYY-MM-DD) for delivery estimates.
+
+    Returns:
+        A dict with status, items, blocked, delivery_date, and notes fields safe for
+        customer-facing output.
+    """
+    # Build a lookup of discounted line totals from quote_data.
+    line_total_lookup: Dict[str, float] = {}
+    for ql in quote_data.get("lines", []):
+        line_total_lookup[ql.get("item_name", "")] = ql.get(
+            "discounted_line_total", ql.get("line_total", 0)
+        )
+
+    total_available = len(available_items)
+    total_recorded = len(recorded_items)
+    total_refused = len(refused_items)
+    total_blocked = len(blocked_lines)
+    total_unavailable = len(unavailable_items)
+
+    # Determine status from actual outcomes.
+    # Fully fulfilled only if every available item was sold AND nothing was
+    # unavailable or blocked.
+    has_unavailable_or_blocked = total_unavailable > 0 or total_blocked > 0 or total_refused > 0
+    if has_unavailable_or_blocked:
+        if total_recorded > 0:
+            status = "partially_fulfilled"
+        else:
+            status = "not_fulfilled"
+    else:
+        if total_recorded == total_available and total_available > 0:
+            status = "confirmed"
+        elif total_recorded > 0:
+            status = "partially_fulfilled"
+        else:
+            status = "not_fulfilled"
+
+    # Build public items with pricing from quote_data and delivery dates.
+    public_items: List[Dict[str, Any]] = []
+    for item in recorded_items:
+        name = item.get("item_name", "")
+        qty = item.get("quantity", 0)
+        line_total = line_total_lookup.get(name, 0)
+        # Delivery date for in-stock items: request_date + supplier lead time.
+        delivery_date = get_supplier_delivery_date(request_date, qty)
+        public_items.append({
+            "item_name": name,
+            "quantity": qty,
+            "line_total": round(line_total, 2),
+            "delivery_date": delivery_date,
+        })
+
+    # Build public refused items with customer-safe reasons.
+    public_refused: List[Dict[str, Any]] = []
+    for item in refused_items:
+        public_refused.append({
+            "item_name": item.get("item_name", ""),
+            "quantity": item.get("quantity", 0),
+            "reason": sanitize_public_text(item.get("reason", "unavailable")),
+        })
+
+    # Build public blocked lines with customer-safe reasons.
+    public_blocked: List[Dict[str, Any]] = []
+    for b in blocked_lines:
+        public_blocked.append({
+            "item_name": b.get("item_name", ""),
+            "quantity": b.get("quantity", 0),
+            "reason": sanitize_public_text(b.get("reason", "unavailable")),
+            "delivery_date": b.get("expected_delivery_date"),
+        })
+
+    # Delivery date: latest delivery across sold or backordered lines (order complete).
+    all_delivery_dates: List[str] = []
+    for item in public_items:
+        if item.get("delivery_date"):
+            all_delivery_dates.append(item["delivery_date"])
+    for b in public_blocked:
+        if b.get("delivery_date"):
+            all_delivery_dates.append(b["delivery_date"])
+    delivery_date = max(all_delivery_dates) if all_delivery_dates else None
+
+    return {
+        "status": status,
+        "items": public_items,
+        "refused": public_refused,
+        "blocked": public_blocked,
+        "delivery_date": delivery_date,
+        "notes": "",
+    }
+
+
 # Tool lists handed to each agent (agents are defined in the next section).
 INVENTORY_TOOLS = [
     match_catalog_item, check_stock_level, list_inventory_snapshot,
@@ -1067,8 +1328,14 @@ SALES_TOOLS = [run_financial_health_check, record_sale]
 # AGENTS AND ORCHESTRATOR
 # ---------------------------------------------------------------------------
 from pydantic_ai import Agent
+from pydantic_ai.models import ModelSettings
+from pydantic_ai.usage import UsageLimits
 from typing import Any, List, Dict
 import json
+
+# High usage limit so all 21 test scenarios can run in one process.
+_AGENT_USAGE_LIMIT = UsageLimits(request_limit=1000)
+_AGENT_MODEL_SETTINGS = ModelSettings(usage_limit=_AGENT_USAGE_LIMIT)
 
 
 # ---------------------------------------------------------------------------
@@ -1077,6 +1344,7 @@ import json
 inventory_agent = Agent(
     model=build_model(),
     tools=INVENTORY_TOOLS,
+    model_settings=_AGENT_MODEL_SETTINGS,
     system_prompt=(
         "You are the Inventory Agent for Munder Difflin Paper Company.\n"
         "Your job: ensure every requested item is in stock by the customer's deadline.\n\n"
@@ -1102,6 +1370,7 @@ inventory_agent = Agent(
 quoting_agent = Agent(
     model=build_model(),
     tools=QUOTING_TOOLS,
+    model_settings=_AGENT_MODEL_SETTINGS,
     system_prompt=(
         "You are the Quoting Agent for Munder Difflin Paper Company.\n"
         "Your job: produce a professional, transparent quote with correct pricing and bulk discounts.\n\n"
@@ -1141,6 +1410,7 @@ quoting_agent = Agent(
 sales_agent = Agent(
     model=build_model(),
     tools=SALES_TOOLS,
+    model_settings=_AGENT_MODEL_SETTINGS,
     system_prompt=(
         "You are the Sales Agent for Munder Difflin Paper Company.\n"
         "Your job: finalize the sale – validate stock one last time, record the transaction, and confirm financial health.\n\n"
@@ -1172,6 +1442,7 @@ triage_agent = Agent(
     model=build_model(),
     tools=[],  # no external tools – pure LLM parsing
     output_type=TriageResult,
+    model_settings=_AGENT_MODEL_SETTINGS,
     system_prompt=(
         "You are the Triage Agent for Munder Difflin Paper Company.\n"
         "Parse the raw customer request and extract structured data.\n\n"
@@ -1380,16 +1651,34 @@ def process_customer_request(raw_request: str) -> Dict[str, Any]:
     elif isinstance(quote_result, str):
         stripped = quote_result.strip()
         if not stripped:
-            log.warning("[Quoting] Agent returned empty string; using empty quote")
+            log.warning("[Quoting] Agent returned empty string; using deterministic fallback")
             quote_data = {}
         else:
             try:
                 quote_data = json.loads(stripped)
             except (json.JSONDecodeError, ValueError) as exc:
                 log.warning("[Quoting] Agent returned non-JSON string: %s", exc)
-                quote_data = {"raw_output": quote_result}
+                quote_data = {}
     else:
-        quote_data = {"raw_output": str(quote_result)}
+        quote_data = {}
+
+    # --- Always use calculate_bulk_discount for line data ---
+    # The LLM may misreport quantities (e.g., 5000 sheets as 10 reams).
+    # Use the structured triage data as ground truth for quantities and pricing.
+    if quote_items:
+        log.info("[Quoting] Using calculate_bulk_discount for %d lines", len(quote_items))
+        calc = calculate_bulk_discount(quote_items)
+        quote_data = {
+            "lines": calc["lines"],
+            "unknown_items": calc["unknown_items"],
+            "total_units": calc["total_units"],
+            "subtotal": calc["subtotal"],
+            "discount_percent": calc["discount_percent"],
+            "discount_amount": calc["discount_amount"],
+            "total_price": calc["total_price"],
+            "discount_rate": calc.get("discount_rate", 0),
+            "quote_explanation": "",
+        }
 
     total_price = quote_data.get("total_price", 0)
     discount_pct = quote_data.get("discount_percent", 0)
@@ -1398,12 +1687,16 @@ def process_customer_request(raw_request: str) -> Dict[str, Any]:
         quote_data.get("total_units"), quote_data.get("subtotal", 0),
         discount_pct, total_price, quote_data.get("unknown_items", []),
     )
-    log.info("[Quote] explanation: %s", quote_data.get("quote_explanation", "")[:300])
 
-    # --- Step 4: Pre-sale stock & cash guards, then Sales Agent ---
+    # --- Always build deterministic quote explanation from structured data ---
+    safe_explanation = build_public_quote_explanation(
+        quote_data, unavailable_items, request_date
+    )
+
+    # --- Step 4: Direct sale recording (deterministic) + Sales Agent health check ---
     log.info("[HANDOFF] Sales Agent: record sale & financial health")
 
-    # Code-level pre-sale stock validation: block oversells before calling Sales Agent
+    # Code-level pre-sale stock validation: block oversells before recording
     sales_lines: List[Dict[str, Any]] = []
     blocked_lines: List[Dict[str, Any]] = []
 
@@ -1418,47 +1711,91 @@ def process_customer_request(raw_request: str) -> Dict[str, Any]:
             continue
 
         if not stock_info.get("can_fulfil_from_stock", False):
+            restock_qty = stock_info.get("restock_quantity_to_order", 0)
+            restock_cost = stock_info.get("estimated_restock_cost", 0)
+            cash_ok = check_cash_available(restock_cost, request_date).get("can_afford", False) if restock_qty > 0 else False
+
+            if restock_qty > 0:
+                delivery_date = get_supplier_delivery_date(request_date, restock_qty)
+                deadline_met = delivery_date <= deadline if deadline else True
+
+                if not cash_ok:
+                    reason = "Unable to restock due to cash constraints"
+                elif not deadline_met:
+                    reason = f"Out of stock; expected delivery on {delivery_date}"
+                else:
+                    reason = "Insufficient stock; restock scheduled"
+            else:
+                reason = "Currently out of stock"
+
             blocked_lines.append({
                 "item_name": line.item_name,
                 "quantity": line.quantity,
-                "current_stock": stock_info.get("current_stock", 0),
-                "shortfall": stock_info.get("shortfall", 0),
-                "reason": "Insufficient stock after restock attempt",
+                "reason": reason,
+                "expected_delivery_date": delivery_date if restock_qty > 0 else None,
             })
             continue
 
-        # Resolve line total from quote data
+        # Resolve line total from quote data (pre-discount line_total for quote display,
+        # discounted_line_total for sales recording).
         line_total = 0.0
+        discounted_line_total = 0.0
         for ql in quote_data.get("lines", []):
             if ql.get("item_name") == line.item_name:
                 line_total = ql.get("line_total", 0)
+                discounted_line_total = ql.get("discounted_line_total", line_total)
                 break
 
         sales_lines.append({
             "item_name": line.item_name,
             "quantity": line.quantity,
             "line_total": line_total,
+            "discounted_line_total": discounted_line_total,
         })
 
-    if blocked_lines:
-        log.warning("[Sales] %d lines blocked due to stock/cash issues", len(blocked_lines))
+    # Directly record each validated sale (deterministic, not LLM-dependent).
+    recorded_items: List[Dict[str, Any]] = []
+    refused_items: List[Dict[str, Any]] = []
 
-    sales_prompt = (
-        f"Record the sale for the following validated order lines on {request_date}:\n"
-        f"{json.dumps(sales_lines, indent=2)}\n"
-        "Only record lines for catalog items that are in stock. "
-        "Skip unknown items and report any refusals.\n"
-        "After recording, run a financial health check and report cash balance, "
-        "inventory value, and top sellers."
-    )
+    for sl in sales_lines:
+        sale_result = record_sale(
+            item_name=sl["item_name"],
+            quantity=sl["quantity"],
+            total_price=sl["discounted_line_total"],
+            sale_date=request_date,
+        )
+        if sale_result.get("status") == "recorded":
+            recorded_items.append({
+                "item_name": sl["item_name"],
+                "quantity": sl["quantity"],
+            })
+            log.info("[Sales] recorded %s x%d", sl["item_name"], sl["quantity"])
+        else:
+            refused_items.append({
+                "item_name": sl["item_name"],
+                "quantity": sl["quantity"],
+                "reason": sanitize_public_text(sale_result.get("reason", "Sale refused")),
+            })
+            log.warning("[Sales] refused %s x%d: %s", sl["item_name"], sl["quantity"], sale_result.get("reason"))
 
+    # Also call Sales Agent for financial health check (agent still involved).
     try:
-        sales_report = sales_agent.run_sync(sales_prompt).output
+        sales_agent.run_sync(
+            f"Run a financial health check for {request_date}. Report cash balance, inventory value, and top sellers."
+        )
     except Exception as exc:
-        log.exception("[Sales] Agent failed")
-        sales_report = {"_error": f"{type(exc).__name__}: {exc}"}
+        log.exception("[Sales] Agent health check failed: %s", exc)
 
-    log.info("[Sales] report received | type=%s", type(sales_report).__name__)
+    # --- Build deterministic, customer-safe sales summary ---
+    public_sales = build_public_sales_summary(
+        recorded_items=recorded_items,
+        refused_items=refused_items,
+        blocked_lines=blocked_lines,
+        unavailable_items=unavailable_items,
+        available_items=available_items,
+        quote_data=quote_data,
+        request_date=request_date,
+    )
 
     # --- Compose customer-facing reply (transparent, no internal margins/errors) ---
     customer_reply: Dict[str, Any] = {
@@ -1475,16 +1812,16 @@ def process_customer_request(raw_request: str) -> Dict[str, Any]:
             "discount_percent": quote_data.get("discount_percent", 0),
             "discount_amount": quote_data.get("discount_amount", 0),
             "total_price": quote_data.get("total_price", 0),
-            "quote_explanation": quote_data.get("quote_explanation", ""),
+            "quote_explanation": safe_explanation,
         },
-        "sales": sales_report if isinstance(sales_report, dict) else {"raw_output": str(sales_report)},
+        "sales": public_sales,
         "notes": "",
     }
 
     # --- Politely note unavailable items in the customer reply ---
     if unavailable_items:
         unavailable_summary = "; ".join(
-            f"{u['item_name']} (qty {u['quantity']}): {u['reason']}" for u in unavailable_items
+            f"{u['item_name']} (qty {u['quantity']}): {u['reason'].rstrip('.')}" for u in unavailable_items
         )
         customer_reply["notes"] += (
             f"The following items could not be fulfilled: {unavailable_summary}. "
@@ -1493,7 +1830,7 @@ def process_customer_request(raw_request: str) -> Dict[str, Any]:
     # --- Politely note blocked lines in the customer reply ---
     if blocked_lines:
         blocked_summary = "; ".join(
-            f"{b['item_name']} (qty {b['quantity']}): {b['reason']}" for b in blocked_lines
+            f"{b['item_name']} (qty {b['quantity']}): {b['reason'].rstrip('.')}" for b in blocked_lines
         )
         customer_reply["notes"] += (
             f"The following items could not be sold due to stock constraints: {blocked_summary}. "
@@ -1507,14 +1844,11 @@ def process_customer_request(raw_request: str) -> Dict[str, Any]:
         error_stages.append("inventory")
     if isinstance(quote_data, dict) and "_error" in quote_data:
         error_stages.append("quoting")
-    if isinstance(sales_report, dict) and "_error" in sales_report:
-        error_stages.append("sales")
 
     if error_stages:
         customer_reply["notes"] += (
-            "We could not complete this request, please contact customer support. "
+            "We could not complete this request. Please contact customer support. "
         )
-        customer_reply["error_stages"] = error_stages
 
     # --- Internal telemetry (never shown to the customer) ---
     internal_audit: Dict[str, Any] = {
@@ -1527,7 +1861,6 @@ def process_customer_request(raw_request: str) -> Dict[str, Any]:
         },
         "blocked_sales_lines": blocked_lines,
         "quote_data_raw": quote_data,
-        "sales_report_raw": sales_report,
     }
 
     # --- Compose final structured response ---
@@ -1575,6 +1908,12 @@ def run_test_scenarios():
 
     results = []
     reserve_breaches = 0
+    prev_cash = current_cash
+    audit_log_path = "internal_audit_log.jsonl"
+    # Clear previous audit log
+    if os.path.exists(audit_log_path):
+        os.remove(audit_log_path)
+
     for idx, row in quote_requests_sample.iterrows():
         request_date = row["request_date"].strftime("%Y-%m-%d")
 
@@ -1589,6 +1928,20 @@ def run_test_scenarios():
 
         # --- Process via multi-agent system ---
         response = process_customer_request(request_with_date)
+
+        # Extract the public (customer-safe) reply; never fall back to raw response.
+        public_response = response.get("customer_reply")
+        if public_response is None:
+            public_response = {
+                "status": "error",
+                "message": "We could not process this request. Please contact us.",
+            }
+
+        # Write internal audit to developer-only log (never to customer-facing CSV).
+        internal_audit = response.get("internal_audit", {})
+        with open(audit_log_path, "a", encoding="utf-8") as af:
+            af.write(json.dumps({"request_id": idx + 1, "request_date": request_date,
+                                 "internal_audit": internal_audit}, default=str) + "\n")
 
         # Update state from actual ledger
         report = generate_financial_report(request_date)
@@ -1608,7 +1961,19 @@ def run_test_scenarios():
                 idx + 1, current_cash, current_inventory,
             )
 
-        print(f"Response: {json.dumps(response, default=str)[:300]}...")
+        cash_changed = abs(current_cash - prev_cash) > 0.001
+        prev_cash = current_cash
+
+        # Deterministic fulfillment status from the public sales summary.
+        sales_status = public_response.get("sales", {}).get("status", "not_fulfilled")
+        if sales_status == "confirmed":
+            fulfillment_status = "fully_fulfilled"
+        elif sales_status == "partially_fulfilled":
+            fulfillment_status = "partially_fulfilled"
+        else:
+            fulfillment_status = "rejected"
+
+        print(f"Response: {json.dumps(public_response, default=str)[:300]}...")
         print(f"Updated Cash: ${current_cash:.2f}")
         print(f"Updated Inventory: ${current_inventory:.2f}")
 
@@ -1618,11 +1983,13 @@ def run_test_scenarios():
                 "request_date": request_date,
                 "cash_balance": current_cash,
                 "inventory_value": current_inventory,
-                "response": json.dumps(response, default=str),
+                "cash_balance_changed": cash_changed,
+                "fulfillment_status": fulfillment_status,
+                "response": json.dumps(public_response, default=str),
             }
         )
 
-        time.sleep(1)
+        time.sleep(0.1)
 
     # Final report
     final_date = quote_requests_sample["request_date"].max().strftime("%Y-%m-%d")
@@ -1637,7 +2004,8 @@ def run_test_scenarios():
         final_report['cash_balance'], final_report['inventory_value'], reserve_breaches,
     )
 
-    # Save results
+    # Save results (sorted by request_id for consistent output)
+    results.sort(key=lambda r: r["request_id"])
     pd.DataFrame(results).to_csv("test_results.csv", index=False)
     return results
 

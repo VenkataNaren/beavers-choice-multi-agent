@@ -5,3 +5,4 @@ __pycache__/
 *.db
 test_connection.py
 check_model.py
+internal_audit_log.jsonl

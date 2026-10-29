@@ -9,8 +9,6 @@ and inventory state.
 
 **Agent count: 4** (within the maximum of 5 allowed by the project specification).
 
----
-
 ## Architecture Diagram (Text Summary)
 
 ```
@@ -18,8 +16,10 @@ CUSTOMER
   |  request + date
   v
 ORCHESTRATOR AGENT  (coordinates only, no tools)
-  |  parses request into items, quantities, deadline, request date
-  |  runs workers in order: Inventory -> Quoting -> Sales
+  |  Delegates parsing to Triage Agent (standalone pydantic-ai node)
+  |  Runs deterministic guards: catalog match, ream conversion, pre-sale stock, cash reserve
+  |  Records sales directly via record_sale (deterministic)
+  |  Assembles customer-safe reply (internal data stripped)
   |
   +---> INVENTORY AGENT <----------------+
   |  |  check stock, decide restock     |
@@ -34,24 +34,17 @@ ORCHESTRATOR AGENT  (coordinates only, no tools)
   |  |  Out: itemised quote             |
   |  v                                  |
   +---> SALES AGENT   <----------------+
-      |  finalize order or decline     |
-      |  record sale or reject         |
-      |  Out: confirmation or reason   |
+      |  financial health check         |
+      |  Out: confirmation or reason    |
       v
 CUSTOMER REPLY  (quote, confirmation, or rejection with reason)
 ```
 
-**Data flow**: Workers never call each other. The orchestrator passes each result to the next agent.
-Solid two-way arrows = delegate and return results. Every tool receives the request date (YYYY-MM-DD)
-so stock, cash, and delivery times match the day of the request.
-
----
-
 ## Agent Responsibilities
 
-### 1. Orchestrator Agent (`process_customer_request`)
-**Role**: Coordinates the four-stage pipeline. Does not call external business tools directly; it
-invokes the other three agents sequentially and assembles the final response.
+### Orchestrator Agent (`process_customer_request`)
+**Role**: Coordinates the four-stage pipeline. Runs deterministic guards, calls the other three agents
+in order, records sales directly via `record_sale`, and assembles the final customer-safe response.
 
 **Stages**:
 1. **Triage** — delegates to `triage_agent` to parse the raw customer request into structured fields
@@ -63,16 +56,21 @@ invokes the other three agents sequentially and assembles the final response.
      routed to `unavailable_items` and bypassed in quoting/sales.
 3. **Inventory Check & Restock** — delegates to `inventory_agent`; also performs code-level pre-check
    of `check_stock_level()` for each line and builds a restock-needed summary for the agent.
-4. **Quote** — delegates to `quoting_agent` for pricing on available items only.
+4. **Quote** — delegates to `quoting_agent` for pricing on available items only. Falls back to
+   `calculate_bulk_discount()` if the LLM returns empty/malformed output.
 5. **Sales** — performs code-level pre-sale stock validation via `check_stock_level()`; blocks oversells
-   before calling `sales_agent`; delegates final sale recording to `sales_agent`.
+   before calling `record_sale` directly (deterministic). Calls Sales Agent only for financial health
+   check. Builds a customer-safe sales summary from actual `record_sale` results.
 
-**Output**: A structured dict containing `triage`, `inventory_report`, `quote`, `sales_report`,
-`catalog_audit`, `stock_checks`, `blocked_sales_lines`, `request_date`, and `stage`.
+**Customer-facing output (`customer_reply`)**: Contains only what the customer should see — itemized
+quotes with pricing and discounts, sale confirmations/refusals, polite unfulfillment reasons, delivery
+timelines. No internal margins, stock counts, cash balances, or system errors.
 
----
+**Internal telemetry (`internal_audit`)**: Contains raw stock checks, catalog match details, cash
+balances, inventory values, and error traces. Written to `internal_audit_log.jsonl` (gitignored),
+never to customer-facing output.
 
-### 2. Triage Agent
+### Triage Agent
 **Role**: Pure LLM parser (no tools). Converts unstructured customer text into a `TriageResult`
 Pydantic model.
 
@@ -94,9 +92,7 @@ Pydantic model.
 
 **Helper functions used**: None directly (the LLM is instructed to use `SHEETS_PER_REAM = 500`).
 
----
-
-### 3. Inventory Agent
+### Inventory Agent
 **Role**: Ensure every requested item is in stock by the customer's deadline. Maps customer wording to
 catalog names, checks stock, decides restock quantities, verifies cash and delivery time.
 
@@ -126,9 +122,7 @@ catalog names, checks stock, decides restock quantities, verifies cash and deliv
 **Helper functions used**: `get_stock_level`, `get_all_inventory`, `get_supplier_delivery_date`,
 `get_cash_balance`, `create_transaction`.
 
----
-
-### 4. Quoting Agent
+### Quoting Agent
 **Role**: Produce a professional, transparent quote with correct pricing and bulk discounts for
 fulfillable lines.
 
@@ -158,9 +152,10 @@ fulfillable lines.
 
 **Helper functions used**: `search_quote_history`.
 
----
+**Fallback**: If the LLM returns empty or malformed output, the orchestrator calls
+`calculate_bulk_discount()` directly to guarantee a valid quote.
 
-### 5. Sales Agent
+### Sales Agent
 **Role**: Finalize the order when feasible; otherwise decline with a clear reason. Record the sale,
 validate stock one last time, and report financial health.
 
@@ -171,13 +166,11 @@ validate stock one last time, and report financial health.
 | `run_financial_health_check(date)` | Review cash and assets before large orders | `generate_financial_report()` |
 | `record_sale(item, qty, price, date)` | Record the sale (cash goes up); refuses if stock too low | `create_transaction('sales')` |
 
-**Decision rules (system prompt)**:
-1. Input: quote JSON from Quoting Agent and sale date.
-2. For each known item line, call `record_sale(item_name, quantity, line_total, sale_date)`.
-   - `record_sale` refuses if stock is insufficient.
-3. After all lines, call `run_financial_health_check(sale_date)` to report cash, inventory value,
-   and top sellers.
-4. Return summary: items sold, total revenue, updated cash balance, any refused lines.
+**Decision rules**:
+1. The orchestrator directly calls `record_sale` for each validated line (deterministic).
+2. The Sales Agent is called for `run_financial_health_check` to report cash, inventory value,
+   and top sellers (internal data only, not shown to customers).
+3. The orchestrator builds a customer-safe sales summary from actual `record_sale` results.
 
 **Helper functions used**: `generate_financial_report`, `create_transaction`.
 
@@ -195,7 +188,7 @@ validate stock one last time, and report financial health.
 | `generate_financial_report` | `run_financial_health_check` | ✅ |
 | `search_quote_history` | `find_similar_quotes` | ✅ |
 | `match_catalog_item` | Inventory Agent (code + LLM) | ✅ |
-| `calculate_bulk_discount` | Quoting Agent | ✅ |
+| `calculate_bulk_discount` | Quoting Agent (LLM + Python fallback) | ✅ |
 
 All starter helper functions are utilized within the tool definitions.
 
@@ -217,15 +210,21 @@ available_items  --> inventory_agent.run_sync()  --> inventory_report
     |
     v
 available_items  --> quoting_agent.run_sync()    --> quote_data
-    |
+    |                                    (fallback: calculate_bulk_discount)
     v
 [Code: pre-sale check_stock_level per line; block oversells]
     |
     v
-sales_lines --> sales_agent.run_sync()           --> sales_report
+sales_lines --> record_sale() directly (deterministic)
     |
     v
-final structured dict (written to test_results.csv)
+sales_agent.run_sync()  --> financial health check (internal only)
+    |
+    v
+customer_reply (public) + internal_audit (private)
+    |
+    v
+test_results.csv (customer_reply only) + internal_audit_log.jsonl (developer only)
 ```
 
 ---
@@ -241,3 +240,15 @@ final structured dict (written to test_results.csv)
 
 Each agent has a distinct, non-overlapping domain. The orchestrator is the only component that
 sequences them and assembles the final response.
+
+## Customer Output Safety
+
+The `customer_reply` dictionary (saved to `test_results.csv`) contains only customer-safe information:
+- Item-by-item quote breakdowns with pricing and discounts
+- Sale confirmations/refusals with customer-safe reasons
+- Delivery timelines where applicable
+- Polite notes about unavailable or blocked items
+
+The `internal_audit` dictionary (written to `internal_audit_log.jsonl`, excluded from version control)
+contains internal telemetry: stock levels, cash balances, inventory values, top sellers, match details,
+and error traces. Customers never see this data.

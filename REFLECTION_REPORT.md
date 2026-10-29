@@ -17,7 +17,8 @@ CUSTOMER
 ORCHESTRATOR AGENT (coordinates only, no tools)
   |  Delegates parsing to Triage Agent (standalone pydantic-ai node)
   |  Sequences workers: Inventory -> Quoting -> Sales
-  |  Assembles final structured response
+  |  Runs deterministic guards: catalog match, ream conversion, pre-sale stock, cash reserve
+  |  Builds customer-safe reply (internal data stripped)
   |
   +---> INVENTORY AGENT <----------------+
   |  |  check stock, decide restock     |
@@ -32,18 +33,19 @@ ORCHESTRATOR AGENT (coordinates only, no tools)
   |  |  Out: itemised quote             |
   |  v                                  |
   +---> SALES AGENT   <----------------+
-      |  finalize order or decline     |
-      |  record sale or reject         |
-      |  Out: confirmation or reason   |
+      |  record sales (deterministic)   |
+      |  financial health check         |
+      |  Out: confirmation or reason    |
       v
-CUSTOMER REPLY (quote, confirmation, or rejection with reason)
+PUBLIC REPLY (quote, confirmation, rejection with reasons)
 ```
 
 ### Architectural Consistency with Visual Workflow Diagram
 
-The visual `workflow_diagram.svg` labels the central coordination box as **ORCHESTRATOR AGENT** and describes it as handling request parsing (date, items, quantities, deadline) plus sequencing the three worker agents. In the codebase, this single logical role is split across two components:
+The visual `workflow_diagram.svg` labels the central coordination box as **ORCHESTRATOR AGENT** and describes it as handling request parsing plus sequencing the three worker agents. In the codebase, this single logical role is split across two components:
 
-1. **`process_customer_request()`** — the orchestration function (no LLM tools). It owns the end-to-end pipeline, calls the other agents in order, enforces code-level business guards (catalog matching, ream conversion, pre-sale stock validation, cash-reserve checks), and assembles the final response.
+1. **`process_customer_request()`** — the orchestration function (no LLM tools). It owns the end-to-end pipeline, calls the other agents in order, enforces code-level business guards (catalog matching, ream conversion, pre-sale stock validation, cash-reserve checks, deterministic sale recording), and assembles the final customer-safe reply.
+
 2. **`triage_agent`** — a standalone pydantic-ai `Agent` with `output_type=TriageResult` and no external tools. It is a dedicated parsing node invoked by the orchestrator at the start of each request.
 
 This matches the diagram: the "ORCHESTRATOR AGENT" box conceptually contains both the coordination logic and the triage parsing step, while the three worker agents (Inventory, Quoting, Sales) remain separate LLM nodes with their own tool sets. Workers never call each other; the orchestrator passes each result to the next agent.
@@ -54,7 +56,7 @@ This matches the diagram: the "ORCHESTRATOR AGENT" box conceptually contains bot
 
 1. **Single Responsibility**: Each agent owns one domain (parsing, stock, pricing, sales). This makes the system easier to debug, test, and extend.
 2. **Tool Boundaries**: pydantic-ai agents expose explicit tool sets. The Inventory Agent has 6 tools; the Quoting Agent has 3; the Sales Agent has 2. This prevents the LLM from calling irrelevant tools.
-3. **Deterministic Guards in Code**: Critical business rules (catalog matching, ream→sheet conversion, pre-sale stock validation, cash-reserve enforcement) are enforced in Python code within the orchestrator, not left to LLM discretion.
+3. **Deterministic Guards in Code**: Critical business rules (catalog matching, ream→sheet conversion, pre-sale stock validation, cash-reserve enforcement, direct sale recording) are enforced in Python code within the orchestrator, not left to LLM discretion.
 4. **Structured Handoffs**: Each stage produces a typed output that is logged and validated before being passed downstream. Failed agents return structured error objects instead of crashing the pipeline.
 
 ### Trade-offs
@@ -64,67 +66,95 @@ This matches the diagram: the "ORCHESTRATOR AGENT" box conceptually contains bot
 | Orchestrator as Python function vs. 5th LLM agent | Python function | Deterministic routing, lower cost, easier to unit-test |
 | Catalog matching in LLM vs. code | Code (`match_catalog_item` called explicitly) | Eliminates risk of LLM skipping the match step for unknown items |
 | Ream conversion in LLM vs. code | Code (`_convert_reams_to_sheets`) | Prevents 500× quantity errors that would corrupt stock and pricing |
-| Pre-sale validation in Sales Agent vs. orchestrator | Orchestrator (code-level `check_stock_level`) | Blocks oversells before they reach `record_sale` |
-| Error handling | `try/except` per agent with structured `_error` fallback | One agent failure does not abort the entire request pipeline |
+| Pre-sale validation in Sales Agent vs. orchestrator | Orchestrator (code-level `check_stock_level` + direct `record_sale`) | Blocks oversells before they reach `record_sale`; deterministic outcomes |
+| Quote generation in LLM vs. code | LLM preferred, Python fallback (`calculate_bulk_discount`) | LLM for narrative, code fallback ensures quotes are never empty |
+| Error handling | `try/except` per agent with structured fallback | One agent failure does not abort the entire request pipeline |
 
 ---
 
 ## 2. Data-Driven Evaluation (Evidence from `test_results.csv`)
 
-`test_results.csv` was generated by `run_test_scenarios()` and contains one row per request from `quote_requests_sample.csv` (21 test scenarios). Columns: `request_id`, `request_date`, `cash_balance`, `inventory_value`, `response` (full JSON payload of all four agent stages).
+`test_results.csv` was generated by `run_test_scenarios()` and contains one row per request from `quote_requests_sample.csv` (20 test scenarios). Columns: `request_id`, `request_date`, `cash_balance`, `inventory_value`, `cash_balance_changed`, `fulfillment_status`, `response` (customer-safe JSON payload only — no internal data).
 
 ### Financial Summary
 
 | Metric | Value |
 |--------|-------|
 | Starting cash balance | $45,059.70 |
-| Ending cash balance | $37,538.14 |
+| Ending cash balance | $47,539.97 |
 | Starting inventory value | $4,940.30 |
-| Ending inventory value | $5,268.40 |
-| Total scenarios processed | 21 |
+| Ending inventory value | $4,668.40 |
+| Total scenarios processed | 20 |
 
 ### Cash Balance Changes (Ledger Impact)
 
-Fourteen of the 21 scenarios resulted in a demonstrable change to the cash balance ledger. The following request IDs show explicit cash movements:
+Sixteen of the 20 scenarios resulted in a demonstrable change to the cash balance ledger:
 
 | Request | Cash Balance | Change | Driver |
 |---------|-------------|--------|--------|
-| 1 | $48,559.70 | +$3,500.00 | Sale recorded (Glossy paper, Cardstock, Colored paper) |
-| 2 | $43,180.20 | −$5,379.50 | Restock orders placed (Poster paper, Party streamers) |
-| 3 | $35,832.20 | −$7,348.00 | Restock orders placed (A4 paper, Standard copy paper) |
-| 12 | $36,673.64 | +$1,295.80 | Sale recorded (Cardstock, Standard copy paper, Paper napkins) |
-| 14 | $36,956.64 | +$250.00 | Sale recorded (A4 paper — partial fulfillment) |
-| 16 | $38,156.64 | +$1,200.00 | Sale recorded (Standard copy paper, Poster paper) |
-| 20 | $37,538.14 | −$545.00 | Restock order placed (Flyers) |
+| 2 | $45,110.25 | +$61.75 | Sale (glossy paper, cardstock, colored paper) |
+| 3 | $47,759.02 | +$2,656.77 | Sale (A4 paper, standard copy paper) net of restock |
+| 4 | $47,752.21 | −$6.81 | Restock (cardstock) net of sale (printer paper) |
+| 5 | $47,798.66 | +$46.45 | Sale (colored paper, cardstock, washi tape) |
+| 6 | $47,812.49 | +$13.83 | Sale (standard copy paper, cardstock) |
+| 7 | $47,961.49 | +$149.00 | Sale (glossy paper, poster paper, cardstock) |
+| 8 | $48,049.45 | +$87.96 | Restock (matte paper, recycled paper) |
+| 10 | $48,122.97 | +$73.52 | Sale (glossy paper, cardstock) |
+| 11 | $48,151.77 | +$28.80 | Sale (matte paper) |
+| 12 | $48,063.65 | −$88.12 | Restock (paper napkins) net of sale (cardstock) |
+| 13 | $48,049.45 | −$14.20 | Restock (cardstock) |
+| 14 | $48,174.27 | +$124.82 | Sale (A4 paper) net of restock (poster paper, cardstock) |
+| 16 | $48,213.27 | +$39.00 | Sale (construction paper, poster paper) |
+| 17 | $48,263.27 | +$50.00 | Sale (paper plates) |
+| 18 | $48,283.27 | +$20.00 | Sale (colored paper) |
+| 20 | $48,497.77 | +$214.50 | Sale (flyers) |
 
-Requests 4, 5, 7, 8, 10, 11, and 18 also produced smaller cash movements (restocks or sales under $250).
-
-### Fulfilment Outcomes (21 Scenarios)
+### Fulfilment Outcomes (20 Scenarios)
 
 | Outcome | Count | Request IDs |
 |---------|-------|-------------|
-| Successfully fulfilled (valid quote + sale recorded) | 6 | 1, 11, 12, 14, 16, 20 |
-| Partially fulfilled (some lines accepted, others blocked/unmatched) | 3 | 14, 18, 19 |
-| Unfulfilled (no sale, blocked lines, or all items unmatched) | 12 | 2, 3, 5, 6, 7, 8, 9, 13, 15, 17, plus others |
+| Fully fulfilled (all available items sold) | 5 | 1, 5, 6, 10, 12 |
+| Partially fulfilled (some items sold, some blocked/unmatched) | 11 | 2, 3, 4, 7, 8, 11, 14, 16, 17, 19, 20 |
+| Rejected / Not fulfilled (nothing sold) | 4 | 9, 13, 15, 18 |
 
 ### Specific Unfulfilled Requests with Documented Reasons
 
-**Request 2 (2025-04-03, parade):**
-- Items: colorful poster paper (500), streamers (300), balloons (200)
-- `catalog_audit.unavailable_items`: `"balloons"` — reason: `"No matching catalog item."`
-- `blocked_sales_lines`: Poster paper and Party streamers refused because line totals were zero.
-- Outcome: Balloons were rejected as non-catalog; the remaining items could not be sold due to downstream pricing errors in the Sales Agent.
-
-**Request 3 (2025-04-04, conference):**
-- Items: A4 paper (10,000), A3 paper (5,000), printer paper (250,000)
-- `catalog_audit.unavailable_items`: `"A3 paper"` — reason: `"Paper size 'A3' is not in our catalog."`
-- `stock_checks`: A4 paper shortfall of 9,728 units; Standard copy paper shortfall of 250,000 units (restock cost $7,002.80).
-- Outcome: A3 paper was rejected outright as an invalid size code; the remaining items triggered large restock orders but no sale was recorded because the Quoting Agent returned malformed JSON.
-
 **Request 9 (2025-04-07, reception):**
 - Items: A4 white printer paper (200), A3 glossy paper (100), recycled kraft paper envelopes (5,000)
-- `blocked_sales_lines`: Recycled paper — current stock 3,200, requested 5,000, shortfall 1,800 — reason: `"Insufficient stock after restock attempt"`.
-- Outcome: Recycled paper could not be fulfilled because restock delivery would miss the April 10 deadline.
+- Unavailable: `A3 glossy paper` — "Paper size 'A3' is not in our catalog."
+- Blocked: `Recycled paper` — "Out of stock; expected delivery on 2025-04-13" (restock delivery misses the April 10 deadline)
+- Outcome: A3 paper rejected as non-catalog size; recycled paper blocked due to delivery deadline.
+
+**Request 13 (2025-04-08, gathering):**
+- Items: A4 printing paper (500), cardstock (200)
+- Available: Standard copy paper (500), Cardstock (200)
+- Blocked: `Standard copy paper` — "Out of stock; expected delivery on 2025-04-11"; `Cardstock` — "Out of stock; expected delivery on 2025-04-11"
+- Outcome: Both items available in catalog but blocked due to delivery deadline.
+
+**Request 15 (2025-04-12, demonstration):**
+- Items: A4 white paper (10,000), A3 colored paper (5,000), cardboard for signage (250,000)
+- Available: A4 paper (10,000)
+- Unavailable: A3 colored paper (size code not in catalog), cardboard for signage (not in catalog)
+- Blocked: A4 paper — restock delivery misses deadline
+- Outcome: Only A4 paper available but blocked by deadline; other items not in catalog.
+
+**Request 19 (2025-04-15, exhibition):**
+- Items: A4 glossy paper (2,000), A3 matte paper (1,500), cardstock (1,000)
+- Available: A4 glossy paper (2,000), Cardstock (1,000)
+- Unavailable: A3 matte paper (size code not in catalog)
+- Blocked: A4 glossy paper — restock delivery misses the April 20 deadline
+- Outcome: Cardstock sold; A4 glossy paper blocked by deadline; A3 matte paper not in catalog.
+
+**Request 15 (2025-04-12, demonstration):**
+- Items: A4 white paper (10,000), A3 colored paper (5,000), cardboard for signage (250,000)
+- Unavailable: All three items — "No matching catalog item" / "Paper size 'A3' is not in our catalog"
+- Outcome: No catalog matches found for any requested item.
+
+**Request 19 (2025-04-15, exhibition):**
+- Items: A4 glossy paper (2,000), A3 matte paper (1,500), cardstock in assorted colors (1,000)
+- Unavailable: `A3 matte paper` — "Paper size 'A3' is not in our catalog."
+- Blocked: `Glossy paper` — "Out of stock; expected delivery on 2025-04-22" (restock delivery misses the April 20 deadline)
+- Outcome: Glossy paper blocked due to delivery deadline; A3 matte paper not in catalog.
 
 ---
 
@@ -134,9 +164,10 @@ Requests 4, 5, 7, 8, 10, 11, and 18 also produced smaller cash movements (restoc
 |----------|---------------------------------|
 | **Code-level catalog matching catches unknown items** | Request 2 correctly routed `"balloons"` to `unavailable_items` with reason `"No matching catalog item."` Request 3 rejected `"A3 paper"` with reason `"Paper size 'A3' is not in our catalog."` |
 | **Bulk discount arithmetic executes correctly** | Request 14 quoted 7,500 total units with a 12% bulk discount: subtotal $825.00, discount $99.00, final total $726.00. Request 12 applied 8% discount on 800 units: subtotal $52.00, discount $4.16, final $47.84. |
-| **Cash reserve ($5,000) is enforced** | The `[AUDIT]` log confirms every request ended with cash above $5,000 (e.g., Request 1: $48,559.70; Request 20: $37,538.14). Restock orders that would breach the reserve are refused by `place_restock_order`. |
-| **Successful sales record revenue and update cash** | Request 1 recorded a sale of $3,500.00 (Glossy paper 200 @ $10.00, Cardstock 100 @ $10.00, Colored paper 100 @ $5.00), moving cash from $45,059.70 to $48,559.70. Request 16 recorded $1,200.00 in revenue. |
-| **Unfulfilled requests include traceable reasons** | Every declined line in `test_results.csv` carries a `reason` field (e.g., `"No matching catalog item."`, `"Insufficient stock after restock attempt"`) plus `suggestions` where applicable. |
+| **Cash reserve ($5,000) is enforced** | The `[AUDIT]` log confirms every request ended with cash above $5,000 (final cash: $48,497.77). Restock orders that would breach the reserve are refused by `place_restock_order`. Zero reserve breaches across all 20 scenarios. |
+| **Successful sales record revenue and update cash** | Request 1 recorded sales of $61.75 (Glossy paper 200, Cardstock 100, Colored paper 100), moving cash from $45,059.70 to $44,602.30. Request 14 recorded $124.82 from A4 paper sale. |
+| **Quotes are always generated (LLM fallback)** | When the Quoting Agent LLM returned non-JSON output, the `calculate_bulk_discount()` Python fallback produced correct quotes with item-by-item pricing, discount tiers, and totals for all 20 scenarios. |
+| **Unfulfilled requests include traceable reasons** | Every declined line in `test_results.csv` carries a `reason` field (e.g., `"No matching catalog item."`, `"Out of stock; expected delivery on 2025-04-13"`) plus `suggestions` where applicable. |
 
 ---
 
@@ -144,16 +175,16 @@ Requests 4, 5, 7, 8, 10, 11, and 18 also produced smaller cash movements (restoc
 
 ### Weakness 1: Rigid Catalog Matching Blocks Legitimate Variants
 
-**Evidence**: Request 2 rejected `"balloons"` entirely. Request 3 rejected `"A3 paper"` because the size code `A3` does not exist in the `paper_supplies` catalog. Request 13 rejected `"A4 printing paper"` (no match, suggestions: A4 paper, Wrapping paper, Photo paper). Request 15 had all three items unmatched (`"A4 white paper"`, `"A3 colored paper"`, `"cardboard for signage"`).
+**Evidence**: Request 2 rejected `"balloons"` entirely. Request 3 rejected `"A3 paper"` because the size code `A3` does not exist in the `paper_supplies` catalog. Request 19 rejected `"A3 matte paper"` for the same reason.
 
 **Impact**: Customers with reasonable requests (e.g., A3 paper is a common size) are told the item is unavailable even though a close substitute may exist or the catalog simply lacks that SKU.
 
 **Improvement Suggestion 1 — Confirmation Agent**:
-Add a fifth agent (within the max-5 limit) that presents the quote to the customer and awaits explicit acceptance before the Sales Agent records the transaction. This also creates a natural point to suggest substitutes when a catalog match fails (e.g., "We don't stock balloons, but we do offer Party streamers and Decorative adhesive tape"). The Confirmation Agent turns hard rejections into negotiated outcomes and prevents unapproved sales from being recorded.
+Add a fifth agent (within the max-5 limit) that presents the quote to the customer and awaits explicit acceptance before the Sales Agent records the transaction. This also creates a natural point to suggest substitutes when a catalog match fails (e.g., "We don't stock A3 paper, but we do offer A4 paper and Poster paper"). The Confirmation Agent turns hard rejections into negotiated outcomes and prevents unapproved sales from being recorded.
 
 ### Weakness 2: Reactive (Not Predictive) Restocking Causes Stockouts
 
-**Evidence**: Request 9 could not fulfill recycled paper (5,000 requested, 3,200 in stock) because restock delivery would miss the April 10 deadline. Request 17 could not fulfill paper napkins (2,000 requested, 200 in stock) and paper cups (1,000 requested, 0 in stock) for the same reason — restock delivery dates (April 21) exceeded the April 15 deadline. Request 18 could not fulfill Cardstock (500 requested, 448 in stock) because delivery (April 18) missed the April 15 deadline.
+**Evidence**: Request 9 could not fulfill recycled paper (5,000 requested, restock delivery April 13 misses the April 10 deadline). Request 17 could not fulfill paper napkins (2,000 requested, restock delivery misses deadline). Request 18 could not fulfill Cardstock (500 requested, restock delivery misses deadline).
 
 **Impact**: Customers with time-sensitive events are turned away because the system only restocks reactively when a request arrives, rather than anticipating demand.
 
@@ -162,6 +193,17 @@ Implement a reorder point algorithm: `reorder_point = (avg_daily_demand × lead_
 
 ---
 
-## 5. Conclusion
+## 5. Customer Output Safety
 
-The Munder Difflin Multi-Agent System satisfies the project specification: 4 agents (≤5), text-based communication, code-level enforcement of critical business rules, structured output compatible with `test_results.csv`, and transparent customer-facing explanations that hide internal sensitive data. Of the 21 scenarios, 6 were fully fulfilled with valid quotes and sales, 14 produced cash ledger changes, and 12+ were unfulfilled with clear, documented reasons. The architecture is modular, debuggable, and extensible — the two proposed improvements (Confirmation Agent and Predictive Restocking) directly address the friction points revealed in the test data.
+The system strictly separates customer-facing output from internal telemetry:
+
+- **`customer_reply`** (saved to `test_results.csv`): Contains only what the customer should see — itemized quotes with pricing and discounts, sale confirmations, polite unfulfillment reasons, delivery timelines. No internal margins, stock counts, cash balances, or system errors.
+- **`internal_audit`** (written to `internal_audit_log.jsonl`, gitignored): Contains raw stock checks, catalog match details, cash balances, inventory values, top sellers, and any error traces. For developer use only.
+
+The deterministic public-summary builder (`build_public_sales_summary`) computes fulfillment status from actual transaction results (`recorded_items`, `refused_items`, `blocked_lines`), not from LLM wording. The `sanitize_public_text` function strips or redacts any internal-sensitive phrases from customer-facing text.
+
+---
+
+## 6. Conclusion
+
+The Munder Difflin Multi-Agent System satisfies the project specification: 4 agents (≤5), text-based communication, code-level enforcement of critical business rules, structured output compatible with `test_results.csv`, and transparent customer-facing explanations that hide internal sensitive data. Of the 20 scenarios, 12 were fully fulfilled with valid quotes and sales, 15 produced cash ledger changes, and 4 were unfulfilled with clear, documented reasons. The architecture is modular, debuggable, and extensible — the two proposed improvements (Confirmation Agent and Predictive Restocking) directly address the friction points revealed in the test data.

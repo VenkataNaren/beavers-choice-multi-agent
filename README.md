@@ -95,164 +95,204 @@ Make sure to submit the following files:
 
 ## Customer-Facing Output Examples
 
-The system separates internal telemetry (`internal_audit`) from the customer-facing reply (`customer_reply`). Below are three concrete examples from `test_results.csv` demonstrating price breakdowns, bulk discounts, delivery timelines, and polite unfulfillment reasons.
+The system separates internal telemetry (`internal_audit`) from the customer-facing reply (`customer_reply`).
+Only `customer_reply` is saved to `test_results.csv`; `internal_audit` is written to `internal_audit_log.jsonl`
+(gitignored, developer-only).
 
-### Example 1 — Fulfilled order with bulk discount (Request 12)
+### Example 1 — Fulfilled order with bulk discount (Request 1)
 
-**Customer input:** "I would like to order 200 sheets of colorful cardstock, 500 sheets of standard printer paper, and 100 paper napkins for our upcoming party. Please deliver these supplies by April 15, 2025." (2025-04-08)
+**Customer input:** "I would like to request the following paper supplies for the ceremony:
+- 200 sheets of A4 glossy paper
+- 100 sheets of heavy cardstock (white)
+- 100 sheets of colored paper (assorted colors)
+I need these supplies delivered by April 15, 2025." (2025-04-01)
 
 **`customer_reply`:**
 
 ```json
 {
-  "request_date": "2025-04-08",
+  "request_date": "2025-04-01",
   "stage": "complete",
   "items_requested": [
-    {"item_name": "colorful cardstock", "quantity": 200},
-    {"item_name": "standard printer paper", "quantity": 500},
-    {"item_name": "paper napkins", "quantity": 100}
+    {"item_name": "A4 glossy paper", "quantity": 200},
+    {"item_name": "heavy cardstock (white)", "quantity": 100},
+    {"item_name": "colored paper (assorted colors)", "quantity": 100}
   ],
   "available_items": [
-    {"item_name": "Cardstock", "quantity": 200},
-    {"item_name": "Standard copy paper", "quantity": 500},
-    {"item_name": "Paper napkins", "quantity": 100}
+    {"item_name": "Glossy paper", "quantity": 200},
+    {"item_name": "Cardstock", "quantity": 100},
+    {"item_name": "Colored paper", "quantity": 100}
   ],
   "unavailable_items": [],
   "quote": {
     "lines": [
-      {"item_name": "Cardstock", "quantity": 200, "unit_price": 0.15, "line_total": 30.00},
-      {"item_name": "Standard copy paper", "quantity": 500, "unit_price": 0.04, "line_total": 20.00},
-      {"item_name": "Paper napkins", "quantity": 100, "unit_price": 0.02, "line_total": 2.00}
+      {"item_name": "Glossy paper", "quantity": 200, "unit_price": 0.2, "line_total": 40.0},
+      {"item_name": "Cardstock", "quantity": 100, "unit_price": 0.15, "line_total": 15.0},
+      {"item_name": "Colored paper", "quantity": 100, "unit_price": 0.1, "line_total": 10.0}
     ],
     "unknown_items": [],
-    "total_units": 800,
-    "subtotal": 52.00,
-    "discount_percent": 8,
-    "discount_amount": 4.16,
-    "total_price": 47.84,
-    "quote_explanation": "Thank you for considering Munder Difflin Paper Company for your party supplies! Below is a detailed breakdown of your order:\\n\\n- Cardstock: 200 sheets @ $0.15 each = $30.00\\n- Standard copy paper: 500 sheets @ $0.04 each = $20.00\\n- Paper napkins: 100 units @ $0.02 each = $2.00\\n\\n**Total Units**: 800 sheets\\n\\nYou qualify for an 8% bulk discount for orders of 500 or more total units, providing a discount amount of **$4.16**.\\n\\n**Subtotal**: $52.00 \\n**Discount**: -$4.16 \\n**Total Price**: $47.84 \\n\\nEstimated delivery for your order is within 5-7 business days... Thank you!"
+    "total_units": 400,
+    "subtotal": 65.0,
+    "discount_percent": 5,
+    "discount_amount": 3.25,
+    "total_price": 61.75,
+    "quote_explanation": ""
   },
   "sales": {
-    "items sold": [
-      {"item": "Cardstock", "quantity": 200, "total price": 1000.00},
-      {"item": "Standard copy paper", "quantity": 500, "total price": 250.00},
-      {"item": "Paper napkins", "quantity": 100, "total price": 50.00}
+    "status": "confirmed",
+    "items": [
+      {"item_name": "Glossy paper", "quantity": 200, "line_total": 40.0},
+      {"item_name": "Cardstock", "quantity": 100, "line_total": 15.0},
+      {"item_name": "Colored paper", "quantity": 100, "line_total": 10.0}
     ],
-    "total revenue": 1300.00,
-    "updated cash balance": 36673.64
+    "refused": [],
+    "blocked": [],
+    "delivery_date": null,
+    "notes": ""
   },
   "notes": ""
 }
 ```
 
-**Key transparency elements:** Item-by-item pricing, 8% bulk discount tier explicitly stated ($4.16 saved), subtotal → discount → final total math, 5–7 business day delivery estimate, zero unavailable items.
+**Key transparency elements:** Item-by-item pricing, 5% bulk discount tier explicitly stated ($3.25 saved),
+subtotal → discount → final total math, zero unavailable items.
 
 ---
 
-### Example 2 — Partial fulfillment with blocked stock line (Request 9)
+### Example 2 — Partial fulfillment with blocked stock line (Request 14)
 
-**Customer input:** "I would like to place an order for the following paper supplies for the reception: - 200 sheets of A4 white printer paper - 100 sheets of A3 glossy paper - 50 packets of 100% recycled kraft paper envelopes. I need these supplies delivered by April 10, 2025." (2025-04-07)
+**Customer input:** "I would like to place a large order for the following paper supplies for an upcoming
+performance:
+- 5,000 sheets of A4 paper
+- 2,000 sheets of poster paper in various colors
+- 500 sheets of cardstock
+I need these supplies delivered by April 15, 2025." (2025-04-09)
 
 **`customer_reply`:**
 
 ```json
 {
-  "request_date": "2025-04-07",
+  "request_date": "2025-04-09",
   "stage": "complete",
   "items_requested": [
-    {"item_name": "A4 white printer paper", "quantity": 200},
-    {"item_name": "A3 glossy paper", "quantity": 100},
-    {"item_name": "100% recycled kraft paper envelopes", "quantity": 5000}
+    {"item_name": "A4 paper", "quantity": 5000},
+    {"item_name": "poster paper in various colors", "quantity": 2000},
+    {"item_name": "cardstock", "quantity": 500}
   ],
   "available_items": [
-    {"item_name": "Standard copy paper", "quantity": 200},
-    {"item_name": "Recycled paper", "quantity": 5000}
+    {"item_name": "A4 paper", "quantity": 5000},
+    {"item_name": "Poster paper", "quantity": 2000},
+    {"item_name": "Cardstock", "quantity": 500}
   ],
-  "unavailable_items": [
-    {"item_name": "A3 glossy paper", "quantity": 100, "reason": "Paper size 'A3' is not in our catalog."}
-  ],
+  "unavailable_items": [],
   "quote": {
     "lines": [
-      {"item_name": "Standard copy paper", "quantity": 200, "unit_price": 0.04, "line_total": 8.0},
-      {"item_name": "Recycled paper", "quantity": 5000, "unit_price": 0.08, "line_total": 400.0}
+      {"item_name": "A4 paper", "quantity": 5000, "unit_price": 0.05, "line_total": 250.0},
+      {"item_name": "Poster paper", "quantity": 2000, "unit_price": 0.25, "line_total": 500.0},
+      {"item_name": "Cardstock", "quantity": 500, "unit_price": 0.15, "line_total": 75.0}
     ],
     "unknown_items": [],
-    "total_units": 5200,
-    "subtotal": 408.00,
+    "total_units": 7500,
+    "subtotal": 825.0,
     "discount_percent": 12,
-    "discount_amount": 48.96,
-    "total_price": 359.04,
-    "quote_explanation": "Dear valued customer,... **Bulk Discount Applied:** 12% for orders of 1000 units or more - you save $48.96! **Final Total:** $359.04 ..."
+    "discount_amount": 99.0,
+    "total_price": 726.0,
+    "quote_explanation": ""
   },
   "sales": {
-    "items sold": [],
-    "total revenue": 0.00,
-    "refusal_reason": "Insufficient stock after restock attempt"
+    "status": "partially_fulfilled",
+    "items": [
+      {"item_name": "A4 paper", "quantity": 5000, "line_total": 250.0}
+    ],
+    "refused": [],
+    "blocked": [
+      {"item_name": "Poster paper", "quantity": 2000, "reason": "Out of stock; expected delivery on 2025-04-16"},
+      {"item_name": "Cardstock", "quantity": 500, "reason": "Out of stock; expected delivery on 2025-04-13"}
+    ],
+    "delivery_date": "2025-04-13",
+    "notes": ""
   },
-  "notes": "The following items could not be fulfilled: A3 glossy paper (qty 100): Paper size 'A3' is not in our catalog. The following items could not be sold due to stock constraints: Recycled paper (qty 5000): Insufficient stock after restock attempt."
+  "notes": "The following items could not be sold due to stock constraints: Poster paper (qty 2000): Out of stock; expected delivery on 2025-04-16; Cardstock (qty 500): Out of stock; expected delivery on 2025-04-13. "
 }
 ```
 
-**Key transparency elements:** Unavailable item (`A3 glossy paper`) explicitly named with reason ("not in our catalog"), blocked line (`Recycled paper`) politely explained with stock constraint reason, no internal profit margins or stack traces leaked.
+**Key transparency elements:** Item-by-item pricing, 12% bulk discount tier ($99.00 saved), blocked lines
+explicitly named with expected delivery dates, no internal stock counts or cash balances exposed.
 
 ---
 
-### Example 3 — Unavailable item politely refused (Request 2)
+### Example 3 — Unavailable items politely refused (Request 20)
 
-**Customer input:** "I would like to place an order for 500 sheets of colorful poster paper, 300 roll of streamers, and 200 balloons for the parade. Please deliver the supplies by April 15, 2025." (2025-04-03)
+**Customer input:** "I would like to place a large order for the following paper supplies for our upcoming
+concert: 5,000 flyers, 2,000 posters, and 10,000 tickets. We need these items delivered by May 15, 2025."
+(2025-04-17)
 
 **`customer_reply`:**
 
 ```json
 {
-  "request_date": "2025-04-03",
+  "request_date": "2025-04-17",
   "stage": "complete",
   "items_requested": [
-    {"item_name": "colorful poster paper", "quantity": 500},
-    {"item_name": "streamers", "quantity": 300},
-    {"item_name": "balloons", "quantity": 200}
+    {"item_name": "flyers", "quantity": 5000},
+    {"item_name": "posters", "quantity": 2000},
+    {"item_name": "tickets", "quantity": 10000}
   ],
   "available_items": [
-    {"item_name": "Poster paper", "quantity": 500},
-    {"item_name": "Party streamers", "quantity": 300}
+    {"item_name": "Flyers", "quantity": 5000}
   ],
   "unavailable_items": [
-    {"item_name": "balloons", "quantity": 200, "reason": "No matching catalog item.", "suggestions": []}
+    {"item_name": "posters", "quantity": 2000, "reason": "No matching catalog item.", "suggestions": ["Poster paper", "Photo paper"]},
+    {"item_name": "tickets", "quantity": 10000, "reason": "No matching catalog item.", "suggestions": ["Sticky notes"]}
   ],
   "quote": {
     "lines": [
-      {"item_name": "Poster paper", "quantity": 1, "unit_price": 0.25, "line_total": 0.25},
-      {"item_name": "Party streamers", "quantity": 300, "unit_price": 0.05, "line_total": 15.0}
+      {"item_name": "Flyers", "quantity": 5000, "unit_price": 0.15, "line_total": 750.0}
     ],
     "unknown_items": [],
-    "total_units": 301,
-    "subtotal": 15.25,
-    "discount_percent": 5,
-    "discount_amount": 0.76,
-    "total_price": 14.49,
-    "quote_explanation": "Thank you for considering Munder Difflin for your upcoming parade event! ... **Total Units**: 301 units\\n\\nSince your order includes a total of 301 units, you qualify for a bulk discount of 5%. Your savings from this discount is $0.76."
+    "total_units": 5000,
+    "subtotal": 750.0,
+    "discount_percent": 12,
+    "discount_amount": 90.0,
+    "total_price": 660.0,
+    "quote_explanation": ""
   },
   "sales": {
-    "refusal_reason": "Line totals were zero; sale could not be recorded"
+    "status": "confirmed",
+    "items": [
+      {"item_name": "Flyers", "quantity": 5000, "line_total": 750.0}
+    ],
+    "refused": [],
+    "blocked": [],
+    "delivery_date": null,
+    "notes": ""
   },
-  "notes": "The following items could not be fulfilled: balloons (qty 200): No matching catalog item."
+  "notes": "The following items could not be fulfilled: posters (qty 2000): No matching catalog item; tickets (qty 10000): No matching catalog item. "
 }
 ```
 
-**Key transparency elements:** `balloons` explicitly listed as unavailable with a polite reason, available items (`Poster paper`, `Party streamers`) still quoted with 5% bulk discount, customer is not left guessing why an item was declined.
+**Key transparency elements:** `posters` and `tickets` explicitly listed as unavailable with polite reasons
+and suggestions ("Poster paper", "Photo paper", "Sticky notes"). Available item (`Flyers`) still quoted
+with 12% bulk discount. Customer is not left guessing why items were declined.
 
 ---
 
 ### Data Safety: What Customers Never See
 
-The `internal_audit` dictionary (kept separate from `customer_reply`) contains raw telemetry that is **never** shown to customers:
+The `internal_audit` dictionary (kept separate from `customer_reply`) contains raw telemetry that is
+**never** shown to customers:
 
 - Raw `_error` traces and exception messages
 - Supplier cost ratio (70% of catalog price) — internal margin
 - Exact cash balance and reserve threshold calculations
 - Raw SQL query results and stock check internals
 - Database schema and table names
+- Exact stock counts (`current_stock`)
 
-If any agent stage fails, the customer receives a polite fallback: *"We could not complete this request, please contact customer support."* — never a raw stack trace.
+If any agent stage fails, the customer receives a polite fallback: *"We could not complete this request.
+Please contact customer support."* — never a raw stack trace.
+
+The `internal_audit` data is written to `internal_audit_log.jsonl` (developer-only, gitignored) and is
+excluded from version control via `.gitignore`.
 
 ---
